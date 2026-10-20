@@ -1,0 +1,14 @@
+<Window x:Class="Se7enAutoclick.OverlayWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="se7en Autoclick · état" WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        Topmost="True" ShowInTaskbar="False" ShowActivated="False" ResizeMode="NoResize" SizeToContent="WidthAndHeight"
+        FontFamily="{StaticResource FontMono}" Focusable="False" IsHitTestVisible="False">
+    <Border Background="#E6000000" BorderBrush="{DynamicResource AccentBrush}" BorderThickness="1" CornerRadius="16" Padding="14,6" Margin="8">
+        <StackPanel>
+            <TextBlock Text="{Binding Status}" Foreground="{DynamicResource AccentBrush}" FontSize="13" HorizontalAlignment="Center" />
+            <TextBlock x:Name="FlashText" Foreground="{DynamicResource TextPrimaryBrush}" FontFamily="{StaticResource FontSans}" FontSize="12"
+                       HorizontalAlignment="Center" Margin="0,3,0,0" Visibility="Collapsed" MaxWidth="520" TextWrapping="Wrap" TextAlignment="Center" />
+        </StackPanel>
+    </Border>
+</Window>
