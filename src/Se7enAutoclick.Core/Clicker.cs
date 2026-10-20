@@ -37,6 +37,9 @@ public sealed class ClickerSettings
     public ClickPosition Position { get; set; } = ClickPosition.Cursor;
     public List<ScreenPoint> Points { get; set; } = [];
 
+    /// <summary>Ne clique que si un point de l'écran a (ou n'a plus) une couleur.</summary>
+    public ColorCondition Condition { get; set; } = new();
+
     public double Cps => 1000.0 / Math.Max(0.5, IntervalMs);
 
     /// <summary>Durée d'appui réellement utilisée.</summary>
@@ -102,11 +105,20 @@ public sealed class Clicker
         int point = 0;
         try
         {
+            long done = 0;
             for (long n = 0; ; n++)
             {
-                if (s.Limit == ClickLimit.Count && n >= s.Count) break;
+                if (s.Limit == ClickLimit.Count && done >= s.Count) break;
                 if (s.Limit == ClickLimit.Duration && clock.NowMs - start >= s.DurationSeconds * 1000) break;
                 if (!clock.WaitUntil(next, cancel)) break;
+
+                // condition couleur pas remplie : on saute ce clic et on revérifie au prochain (au plus tard 50 ms)
+                if (!s.Condition.Satisfied())
+                {
+                    next = Math.Max(next + Math.Min(s.IntervalMs, 50), clock.NowMs);
+                    start = next - (n + 1) * s.IntervalMs;
+                    continue;
+                }
 
                 if (s.Position == ClickPosition.Fixed && s.Points.Count > 0) Injector.MoveTo(s.Points[0].X, s.Points[0].Y);
                 else if (s.Position == ClickPosition.Points && s.Points.Count > 0)
@@ -123,6 +135,7 @@ public sealed class Clicker
                     // double-clic : écart court (30 ms au plus, moins à très haute vitesse)
                     if (s.DoubleClick && k == 0 && !clock.WaitUntil(clock.NowMs + Math.Max(hold, Math.Min(30, s.IntervalMs / 3)), cancel)) return;
                 }
+                done++;
                 Interlocked.Increment(ref _clicks);
                 lock (_statsGate) _recent.Enqueue(Environment.TickCount64);
 

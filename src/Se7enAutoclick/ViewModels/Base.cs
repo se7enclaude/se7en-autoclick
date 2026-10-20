@@ -29,6 +29,7 @@ public static class Converters
     public static readonly IValueConverter InverseBoolToVisibility = new Fn(v => v is true ? Visibility.Collapsed : Visibility.Visible);
     public static readonly IValueConverter NotEmptyToVisibility = new Fn(v => v is string { Length: > 0 } ? Visibility.Visible : Visibility.Collapsed);
     public static readonly IValueConverter Not = new Fn(v => v is not true, v => v is not true);
+    public static readonly IValueConverter ZeroToVisibility = new Fn(v => v is 0 ? Visibility.Visible : Visibility.Collapsed);
 
     /// <summary>Bouton radio lié à une valeur d'énumération : ConverterParameter = nom de la valeur.</summary>
     public static readonly IValueConverter EnumIs = new EnumConverter();

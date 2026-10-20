@@ -254,6 +254,29 @@
                                         </DockPanel>
                                     </StackPanel>
                                 </HeaderedContentControl>
+
+                                <HeaderedContentControl Style="{StaticResource Card}" Header="Condition couleur" Margin="0,10,0,0"
+                                                        c:Ui.Subtitle="Ne clique que quand un point de l'écran a (ou n'a plus) une couleur : un bouton « Collect » qui apparaît, une barre pleine…">
+                                    <StackPanel>
+                                        <Border Style="{StaticResource SegBar}" HorizontalAlignment="Left" Margin="0,0,0,12">
+                                            <StackPanel Orientation="Horizontal">
+                                                <RadioButton Style="{StaticResource SegItem}" Content="Toujours cliquer" GroupName="Cond" IsChecked="{Binding Condition.Mode, Converter={x:Static vm:Converters.EnumIs}, ConverterParameter=Off}" />
+                                                <RadioButton Style="{StaticResource SegItem}" Content="Si la couleur est là" GroupName="Cond" IsChecked="{Binding Condition.Mode, Converter={x:Static vm:Converters.EnumIs}, ConverterParameter=WhenMatches}" />
+                                                <RadioButton Style="{StaticResource SegItem}" Content="Si elle n'y est plus" GroupName="Cond" IsChecked="{Binding Condition.Mode, Converter={x:Static vm:Converters.EnumIs}, ConverterParameter=WhenDifferent}" />
+                                            </StackPanel>
+                                        </Border>
+                                        <StackPanel Visibility="{Binding Condition.Mode, Converter={x:Static vm:Converters.EnumToVisibility}, ConverterParameter=WhenMatches|WhenDifferent}">
+                                            <DockPanel Margin="0,0,0,10">
+                                                <Button DockPanel.Dock="Right" Style="{StaticResource SmallPrimaryButton}" c:Ui.Icon="&#xE7B7;" Content="Choisir le point" Click="PickConditionColor_Click" Margin="0" VerticalAlignment="Center" />
+                                                <Border Width="22" Height="22" CornerRadius="4" Background="{Binding ConditionBrush}" BorderBrush="{DynamicResource BorderStrongBrush}" BorderThickness="1" Margin="0,0,10,0" VerticalAlignment="Center" />
+                                                <TextBlock Text="{Binding ConditionText}" Style="{StaticResource StrongText}" FontFamily="{StaticResource FontMono}" VerticalAlignment="Center" />
+                                            </DockPanel>
+                                            <c:ValueBar Label="Tolérance" Minimum="0" Maximum="120" Tick="1" Value="{Binding Condition.Tolerance}" Format="± {0:0}" />
+                                            <TextBlock Style="{StaticResource CaptionText}" TextWrapping="Wrap"
+                                                       Text="Clique sur le point quand il a la bonne couleur : se7en Autoclick la retient. Monte la tolérance si la couleur bouge un peu (lumière, animation)." />
+                                        </StackPanel>
+                                    </StackPanel>
+                                </HeaderedContentControl>
                             </StackPanel>
 
                             <StackPanel Grid.Column="2">
@@ -386,7 +409,7 @@
                         <!-- bibliothèque + étapes -->
                         <Grid>
                             <Grid.RowDefinitions>
-                                <RowDefinition Height="*" /><RowDefinition Height="10" /><RowDefinition Height="*" />
+                                <RowDefinition Height="*" MinHeight="230" /><RowDefinition Height="10" /><RowDefinition Height="1.6*" />
                             </Grid.RowDefinitions>
                             <HeaderedContentControl Style="{StaticResource Card}" Header="Mes macros">
                                 <HeaderedContentControl.Tag>
@@ -429,11 +452,63 @@
                                 </DockPanel>
                             </HeaderedContentControl>
 
-                            <HeaderedContentControl Grid.Row="2" Style="{StaticResource Card}" Header="Étapes" c:Ui.Subtitle="Touches et clics de la macro choisie (les mouvements de souris ne sont pas listés)">
-                                <Border Style="{StaticResource Well}" Padding="12,8">
-                                    <ListBox ItemsSource="{Binding Steps}" Background="Transparent" BorderThickness="0" Foreground="{DynamicResource TextSecondaryBrush}"
-                                             FontFamily="{StaticResource FontMono}" FontSize="12" VirtualizingPanel.IsVirtualizing="True" />
-                                </Border>
+                            <HeaderedContentControl Grid.Row="2" Style="{StaticResource Card}" Header="Étapes"
+                                                    c:Ui.Subtitle="Choisis une étape pour la retoucher. Les mouvements de souris suivent leur étape.">
+                                <HeaderedContentControl.Tag>
+                                    <Button Style="{StaticResource SmallGhostButton}" c:Ui.Icon="&#xE7A7;" Content="Annuler" Click="Undo_Click" Margin="0" IsEnabled="{Binding CanUndo}" />
+                                </HeaderedContentControl.Tag>
+                                <DockPanel>
+                                    <StackPanel DockPanel.Dock="Bottom" Margin="0,10,0,0">
+                                        <WrapPanel>
+                                            <Button Style="{StaticResource SmallSecondaryButton}" Content="Commencer ici" Click="TrimBefore_Click" Margin="0,0,6,6" IsEnabled="{Binding HasStep}"
+                                                    ToolTip="Coupe tout ce qui est avant cette étape" />
+                                            <Button Style="{StaticResource SmallSecondaryButton}" Content="Finir ici" Click="TrimAfter_Click" Margin="0,0,6,6" IsEnabled="{Binding HasStep}"
+                                                    ToolTip="Coupe tout ce qui est après cette étape" />
+                                            <Button Style="{StaticResource SmallDangerButton}" Content="Supprimer l'étape" Click="DeleteStep_Click" Margin="0,0,6,6" IsEnabled="{Binding HasStep}" />
+                                        </WrapPanel>
+                                        <WrapPanel>
+                                            <Button Style="{StaticResource SmallSecondaryButton}" c:Ui.Icon="&#xE7B7;" Content="Attendre une couleur" Click="WaitColor_Click" Margin="0,0,6,6" IsEnabled="{Binding HasMacro}"
+                                                    ToolTip="Avant l'étape choisie : attend qu'un point de l'écran prenne une couleur" />
+                                            <Button Style="{StaticResource SmallGhostButton}" Content="… qu'elle disparaisse" Click="WaitColorGone_Click" Margin="0,0,6,6" IsEnabled="{Binding HasMacro}"
+                                                    ToolTip="Avant l'étape choisie : attend qu'un point de l'écran perde sa couleur" />
+                                            <StackPanel Orientation="Horizontal" Margin="6,0,0,6" IsEnabled="{Binding HasStep}">
+                                                <TextBlock Text="Délai avant" Style="{StaticResource MetaText}" VerticalAlignment="Center" Margin="0,0,8,0" />
+                                                <TextBox Style="{StaticResource Number}" Width="90" Text="{Binding StepDelay, UpdateSourceTrigger=LostFocus, StringFormat={}{0:0}}" KeyDown="Number_KeyDown" />
+                                                <TextBlock Text="ms" Style="{StaticResource MetaText}" VerticalAlignment="Center" Margin="8,0,0,0" />
+                                            </StackPanel>
+                                        </WrapPanel>
+                                    </StackPanel>
+                                    <Border Style="{StaticResource Well}" Padding="6,6">
+                                        <ListBox x:Name="StepList" ItemsSource="{Binding Steps}" SelectedIndex="{Binding SelectedStep}" Background="Transparent" BorderThickness="0"
+                                                 Foreground="{DynamicResource TextSecondaryBrush}" FontFamily="{StaticResource FontMono}" FontSize="12"
+                                                 VirtualizingPanel.IsVirtualizing="True" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                                            <ListBox.ItemContainerStyle>
+                                                <Style TargetType="ListBoxItem">
+                                                    <Setter Property="Padding" Value="6,3" />
+                                                    <Setter Property="Cursor" Value="Hand" />
+                                                    <Setter Property="Template">
+                                                        <Setter.Value>
+                                                            <ControlTemplate TargetType="ListBoxItem">
+                                                                <Border x:Name="b" Background="Transparent" CornerRadius="3" Padding="{TemplateBinding Padding}">
+                                                                    <ContentPresenter />
+                                                                </Border>
+                                                                <ControlTemplate.Triggers>
+                                                                    <Trigger Property="IsMouseOver" Value="True">
+                                                                        <Setter TargetName="b" Property="Background" Value="{DynamicResource HoverBrush}" />
+                                                                    </Trigger>
+                                                                    <Trigger Property="IsSelected" Value="True">
+                                                                        <Setter TargetName="b" Property="Background" Value="{DynamicResource InverseBrush}" />
+                                                                        <Setter Property="Foreground" Value="{DynamicResource TextInverseBrush}" />
+                                                                    </Trigger>
+                                                                </ControlTemplate.Triggers>
+                                                            </ControlTemplate>
+                                                        </Setter.Value>
+                                                    </Setter>
+                                                </Style>
+                                            </ListBox.ItemContainerStyle>
+                                        </ListBox>
+                                    </Border>
+                                </DockPanel>
                             </HeaderedContentControl>
                         </Grid>
 
@@ -447,6 +522,13 @@
                                     <StackPanel>
                                         <ProgressBar Height="3" Minimum="0" Maximum="1" Value="{Binding PlayProgress, Mode=OneWay}" Foreground="{DynamicResource AccentBrush}"
                                                      Background="{DynamicResource MeterOffBrush}" BorderThickness="0" Margin="0,0,0,14" />
+                                        <TextBlock Text="Lire" Style="{StaticResource Field}" />
+                                        <Border Style="{StaticResource SegBar}" HorizontalAlignment="Left" Margin="0,0,0,12">
+                                            <StackPanel Orientation="Horizontal">
+                                                <RadioButton Style="{StaticResource SegItem}" Content="La macro choisie" GroupName="Src" IsChecked="{Binding Play.UseChain, Converter={x:Static vm:Converters.Not}}" />
+                                                <RadioButton Style="{StaticResource SegItem}" Content="L'enchaînement" GroupName="Src" IsChecked="{Binding Play.UseChain}" />
+                                            </StackPanel>
+                                        </Border>
                                         <TextBlock Text="Répéter" Style="{StaticResource Field}" />
                                         <Border Style="{StaticResource SegBar}" HorizontalAlignment="Left" Margin="0,0,0,10">
                                             <StackPanel Orientation="Horizontal">
@@ -470,6 +552,36 @@
                                     </StackPanel>
                                 </HeaderedContentControl>
 
+                                <HeaderedContentControl Style="{StaticResource Card}" Header="Enchaînement" Margin="0,0,0,10"
+                                                        c:Ui.Subtitle="Plusieurs macros à la suite, chacune répétée, le tout en boucle. Ex : aller au spot ×1, farmer ×20, vendre ×1.">
+                                    <HeaderedContentControl.Tag>
+                                        <Button Style="{StaticResource SmallPrimaryButton}" c:Ui.Icon="&#xE710;" Content="Ajouter" Click="AddToChain_Click" Margin="0" IsEnabled="{Binding HasMacro}"
+                                                ToolTip="Ajoute la macro choisie à la fin" />
+                                    </HeaderedContentControl.Tag>
+                                    <StackPanel>
+                                        <TextBlock Text="Choisis une macro à gauche, puis « Ajouter »." Style="{StaticResource CaptionText}" Margin="0,0,0,6"
+                                                   Visibility="{Binding Chain.Count, Converter={x:Static vm:Converters.ZeroToVisibility}}" />
+                                        <ItemsControl ItemsSource="{Binding Chain}">
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate DataType="{x:Type vm:ChainItem}">
+                                                    <Border Style="{StaticResource Well}" Padding="10,6" Margin="0,0,0,6">
+                                                        <DockPanel>
+                                                            <Button DockPanel.Dock="Right" Style="{StaticResource GhostIconButton}" Content="&#xE711;" FontSize="10" Click="RemoveFromChain_Click" Tag="{Binding}" ToolTip="Retirer" />
+                                                            <Button DockPanel.Dock="Right" Style="{StaticResource GhostIconButton}" Content="&#xE70D;" FontSize="10" Click="ChainDown_Click" Tag="{Binding}" ToolTip="Descendre" />
+                                                            <Button DockPanel.Dock="Right" Style="{StaticResource GhostIconButton}" Content="&#xE70E;" FontSize="10" Click="ChainUp_Click" Tag="{Binding}" ToolTip="Monter" />
+                                                            <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" Margin="8,0">
+                                                                <TextBlock Text="×" Style="{StaticResource MetaText}" VerticalAlignment="Center" Margin="0,0,6,0" />
+                                                                <TextBox Style="{StaticResource Number}" Width="64" Text="{Binding Repeat, UpdateSourceTrigger=LostFocus}" KeyDown="Number_KeyDown" />
+                                                            </StackPanel>
+                                                            <TextBlock Text="{Binding Name}" Style="{StaticResource StrongText}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                                                        </DockPanel>
+                                                    </Border>
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+                                    </StackPanel>
+                                </HeaderedContentControl>
+
                                 <HeaderedContentControl Style="{StaticResource Card}" Header="Souris" c:Ui.Subtitle="Comment rejouer les mouvements" Margin="0,0,0,10">
                                     <StackPanel>
                                         <Border Style="{StaticResource SegBar}" HorizontalAlignment="Left" Margin="0,0,0,10">
@@ -480,6 +592,30 @@
                                         </Border>
                                         <TextBlock Style="{StaticResource CaptionText}" TextWrapping="Wrap"
                                                    Text="« Jeu 3D » rejoue les mouvements comme ta vraie souris : la caméra tourne pareil. « Positions à l'écran » replace le curseur exactement : pour les menus et les jeux en 2D." />
+                                    </StackPanel>
+                                </HeaderedContentControl>
+
+                                <HeaderedContentControl Style="{StaticResource Card}" Header="Anti-AFK Roblox" Margin="0,0,0,10"
+                                                        c:Ui.Subtitle="Roblox t'éjecte après 20 minutes sans rien faire. Toutes les X minutes, un petit geste est envoyé à Roblox, même s'il est derrière une autre fenêtre.">
+                                    <HeaderedContentControl.Tag>
+                                        <ToggleButton Style="{StaticResource Switch}" IsChecked="{Binding Afk.Enabled}" />
+                                    </HeaderedContentControl.Tag>
+                                    <StackPanel>
+                                        <Border Style="{StaticResource SegBar}" HorizontalAlignment="Left" Margin="0,0,0,12">
+                                            <StackPanel Orientation="Horizontal">
+                                                <RadioButton Style="{StaticResource SegItem}" Content="Saut" GroupName="Afk" IsChecked="{Binding Afk.Action, Converter={x:Static vm:Converters.EnumIs}, ConverterParameter=Jump}" />
+                                                <RadioButton Style="{StaticResource SegItem}" Content="Petit pas" GroupName="Afk" IsChecked="{Binding Afk.Action, Converter={x:Static vm:Converters.EnumIs}, ConverterParameter=Step}" />
+                                                <RadioButton Style="{StaticResource SegItem}" Content="Caméra" GroupName="Afk" IsChecked="{Binding Afk.Action, Converter={x:Static vm:Converters.EnumIs}, ConverterParameter=Camera}" />
+                                                <RadioButton Style="{StaticResource SegItem}" Content="Clic" GroupName="Afk" IsChecked="{Binding Afk.Action, Converter={x:Static vm:Converters.EnumIs}, ConverterParameter=Click}" />
+                                            </StackPanel>
+                                        </Border>
+                                        <c:ValueBar Label="Toutes les" Minimum="1" Maximum="19" Tick="1" Value="{Binding Afk.Minutes}" Format="{}{0:0} min" />
+                                        <DockPanel>
+                                            <Button DockPanel.Dock="Right" Style="{StaticResource SmallSecondaryButton}" Content="Tester" Click="TestAfk_Click" Margin="0" />
+                                            <TextBlock Text="{Binding AfkNext}" Style="{StaticResource MetaText}" VerticalAlignment="Center" />
+                                        </DockPanel>
+                                        <TextBlock Style="{StaticResource CaptionText}" TextWrapping="Wrap" Margin="0,10,0,0"
+                                                   Text="Le geste attend que tu ne tapes pas pour passer Roblox devant un quart de seconde, puis ta fenêtre revient. Rien n'est envoyé pendant qu'une macro ou l'autoclic tourne." />
                                     </StackPanel>
                                 </HeaderedContentControl>
 

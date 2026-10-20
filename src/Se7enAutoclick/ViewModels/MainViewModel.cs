@@ -30,11 +30,25 @@ public sealed class MacroItem(string name, Macro? macro) : Observable
         : $"{TimeSpan.FromMilliseconds(Macro.DurationMs):mm\\:ss} · {Macro.KeyPresses} touches · {Macro.Clicks} clics";
 }
 
+/// <summary>Une ligne de l'enchaînement : une macro et son nombre de répétitions.</summary>
+public sealed class ChainItem(ChainEntry entry) : Observable
+{
+    public ChainEntry Entry { get; } = entry;
+    public string Name => Entry.Macro;
+    public int Repeat
+    {
+        get => Entry.Repeat;
+        set { Entry.Repeat = Math.Clamp(value, 1, 100_000); Raise(); }
+    }
+}
+
 public sealed class MainViewModel : Observable, IDisposable
 {
     private readonly InputHub _hub = new();
     private readonly Clicker _clicker = new();
     private readonly Player _player = new();
+    private readonly AntiAfk _antiAfk = new();
+    private readonly Stack<Macro> _undo = new();
     private readonly MacroLibrary _library = new(AppSettings.MacrosFolder);
     private readonly DispatcherTimer _tick;
     private readonly Dispatcher _ui = Application.Current.Dispatcher;
@@ -50,6 +64,8 @@ public sealed class MainViewModel : Observable, IDisposable
     public ObservableCollection<MacroItem> Macros { get; } = [];
     public ObservableCollection<ScreenPoint> Points { get; } = [];
     public ObservableCollection<string> Steps { get; } = [];
+    public ObservableCollection<ChainItem> Chain { get; } = [];
+    public AntiAfkSettings Afk => Settings.AntiAfk;
 
     /// <summary>Message à afficher (toast).</summary>
     public event Action<string>? Notify;
@@ -60,6 +76,7 @@ public sealed class MainViewModel : Observable, IDisposable
         foreach (var p in Click.Points) Points.Add(p);
         RefreshBindings();
         RefreshMacros(Settings.CurrentMacro);
+        foreach (var c in Play.Chain) Chain.Add(new ChainItem(c));
         _lastSaved = System.Text.Json.JsonSerializer.Serialize(Settings);
 
         _hub.Hotkey += (id, down) => _ui.BeginInvoke(() => OnHotkey(id, down));
@@ -72,6 +89,10 @@ public sealed class MainViewModel : Observable, IDisposable
             Beep(false);
             if (reason is not null) Notify?.Invoke(reason);
         });
+
+        _antiAfk.IsBusy = () => _clicker.IsRunning || _player.IsRunning;
+        _antiAfk.Done += msg => _ui.BeginInvoke(() => { Notify?.Invoke(msg); Raise(nameof(AfkNext)); });
+        _antiAfk.Apply(Afk);
 
         _tick = new DispatcherTimer(TimeSpan.FromMilliseconds(100), DispatcherPriority.Background, (_, _) => Tick(), _ui);
         _tick.Start();
@@ -89,11 +110,13 @@ public sealed class MainViewModel : Observable, IDisposable
     public string RecordEvents => (_recorder?.Count ?? 0).ToString("N0");
     public double PlayProgress => IsPlaying ? _player.Progress : 0;
     public string PlayLoop => IsPlaying ? $"{_player.Loop}" + (Play.Loop == LoopMode.Count ? $" / {Play.LoopCount}" : "") : "—";
+    public string PlayCurrent => IsPlaying ? _player.Current : "";
 
     /// <summary>Texte de l'overlay et de la barre du haut.</summary>
     public string Status =>
         IsRecording ? $"● ENREGISTREMENT  {RecordTime}"
-        : IsPlaying ? $"▶ MACRO  boucle {PlayLoop}"
+        : IsPlaying && _player.Waiting ? $"⏳ {PlayCurrent}  attente couleur"
+        : IsPlaying ? $"▶ {PlayCurrent}  boucle {PlayLoop}"
         : ClickerRunning ? $"AUTOCLIC  {MeasuredCps} clics/s"
         : "PRÊT";
 
@@ -103,7 +126,8 @@ public sealed class MainViewModel : Observable, IDisposable
     {
         if (ClickerRunning) { Raise(nameof(ClickCount)); Raise(nameof(MeasuredCps)); }
         if (IsRecording) { Raise(nameof(RecordTime)); Raise(nameof(RecordEvents)); }
-        if (IsPlaying) { Raise(nameof(PlayProgress)); Raise(nameof(PlayLoop)); }
+        if (IsPlaying) { Raise(nameof(PlayProgress)); Raise(nameof(PlayLoop)); Raise(nameof(PlayCurrent)); }
+        if (Afk.Enabled) Raise(nameof(AfkNext));
         Raise(nameof(Status));
         Raise(nameof(Busy));
         SaveIfChanged();
@@ -112,6 +136,8 @@ public sealed class MainViewModel : Observable, IDisposable
     private void SaveIfChanged()
     {
         Click.Points = Points.ToList();
+        Play.Chain = Chain.Select(c => c.Entry).ToList();
+        _antiAfk.Apply(Afk);
         string json = System.Text.Json.JsonSerializer.Serialize(Settings);
         if (json == _lastSaved) return;
         _lastSaved = json;
@@ -258,6 +284,38 @@ public sealed class MainViewModel : Observable, IDisposable
         if (Click.Position == ClickPosition.Cursor) { Click.Position = replace ? ClickPosition.Fixed : ClickPosition.Points; Raise(nameof(Click)); }
     }
 
+    public ColorCondition Condition => Click.Condition;
+    public string ConditionText => Condition.Color < 0 ? "Aucun point choisi" : $"({Condition.X}, {Condition.Y})  {ScreenColor.Hex(Condition.Color)}";
+    public System.Windows.Media.Brush ConditionBrush => Swatch(Condition.Color);
+
+    private static System.Windows.Media.Brush Swatch(int rgb) => rgb < 0
+        ? System.Windows.Media.Brushes.Transparent
+        : new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb((byte)(rgb >> 16), (byte)(rgb >> 8), (byte)rgb));
+
+    /// <summary>Clic sur un point de l'écran : on retient sa position et sa couleur actuelle.</summary>
+    private async Task<(int X, int Y, int Rgb)?> PickColorAsync()
+    {
+        PickingPoint = true;
+        Notify?.Invoke("Clique sur le point à surveiller, quand il a la bonne couleur (Échap pour annuler)");
+        var p = await _hub.CapturePointAsync();
+        PickingPoint = false;
+        if (p is not { } pt) return null;
+        await Task.Delay(30);
+        return (pt.X, pt.Y, ScreenColor.At(pt.X, pt.Y));
+    }
+
+    public async void PickConditionColor()
+    {
+        if (await PickColorAsync() is not { } c) return;
+        Condition.X = c.X;
+        Condition.Y = c.Y;
+        Condition.Color = c.Rgb;
+        if (Condition.Mode == ColorMode.Off) Condition.Mode = ColorMode.WhenMatches;
+        Raise(nameof(Condition));
+        Raise(nameof(ConditionText));
+        Raise(nameof(ConditionBrush));
+    }
+
     public void ToggleClicker()
     {
         if (ClickerRunning) StopClicker();
@@ -295,16 +353,105 @@ public sealed class MainViewModel : Observable, IDisposable
         get => _selected;
         set
         {
+            if (_selected?.Name != value?.Name) { _undo.Clear(); Raise(nameof(CanUndo)); }
             if (!Set(ref _selected, value)) return;
             Settings.CurrentMacro = value?.Name;
             Steps.Clear();
             if (value?.Macro is { } m)
-                foreach (var s in m.Steps().Take(2000)) Steps.Add(s);
+                foreach (var s in m.Steps().Take(5000)) Steps.Add(s);
+            _step = -1;
+            Raise(nameof(SelectedStep));
+            Raise(nameof(HasStep));
             Raise(nameof(HasMacro));
         }
     }
 
     public bool HasMacro => SelectedMacro?.Macro is not null;
+
+    private int _step = -1;
+
+    /// <summary>Étape choisie dans la liste (-1 = aucune).</summary>
+    public int SelectedStep
+    {
+        get => _step;
+        set
+        {
+            if (!Set(ref _step, value)) return;
+            Raise(nameof(HasStep));
+            Raise(nameof(StepDelay));
+        }
+    }
+
+    public bool HasStep => _step >= 0 && SelectedMacro?.Macro is { } m && _step < MacroEditor.StepCount(m);
+    public bool CanUndo => _undo.Count > 0;
+
+    /// <summary>Délai avant l'étape choisie, en ms (modifiable).</summary>
+    public double StepDelay
+    {
+        get => HasStep ? Math.Round(MacroEditor.DelayBefore(SelectedMacro!.Macro!, _step)) : 0;
+        set { if (HasStep) Edit(m => MacroEditor.SetDelayBefore(m, _step, value), keepStep: true); }
+    }
+
+    public void DeleteStep() { if (HasStep) Edit(m => MacroEditor.DeleteStep(m, _step), keepStep: true); }
+    public void TrimBefore() { if (HasStep) Edit(m => MacroEditor.TrimBefore(m, _step), keepStep: false); }
+    public void TrimAfter() { if (HasStep) Edit(m => MacroEditor.TrimAfter(m, _step), keepStep: true); }
+
+    public async void InsertWaitColor(bool untilGone)
+    {
+        if (SelectedMacro?.Macro is null) return;
+        int at = HasStep ? _step : MacroEditor.StepCount(SelectedMacro.Macro);
+        if (await PickColorAsync() is not { } c) return;
+        Edit(m => MacroEditor.InsertWaitColor(m, at, c.X, c.Y, c.Rgb, 24, untilGone), keepStep: true);
+        Notify?.Invoke(untilGone ? $"Attente ajoutée · la macro attendra que ce point change de couleur ({ScreenColor.Hex(c.Rgb)})"
+                                 : $"Attente ajoutée · la macro attendra que ce point soit {ScreenColor.Hex(c.Rgb)}");
+    }
+
+    public void Undo()
+    {
+        if (_undo.Count == 0 || SelectedMacro is null) return;
+        var previous = _undo.Pop();
+        _library.Save(previous);
+        RefreshMacros(previous.Name);
+        Raise(nameof(CanUndo));
+    }
+
+    private void Edit(Func<Macro, Macro> change, bool keepStep)
+    {
+        if (SelectedMacro?.Macro is not { } m || IsPlaying) return;
+        int step = _step;
+        try
+        {
+            var edited = change(m);
+            _undo.Push(m);
+            _library.Save(edited);
+            RefreshMacros(edited.Name);
+            SelectedStep = keepStep ? Math.Min(step, MacroEditor.StepCount(edited) - 1) : 0;
+            Raise(nameof(CanUndo));
+        }
+        catch (Exception ex) { Notify?.Invoke("Modification impossible : " + ex.Message); }
+    }
+
+    // ------------------------------------------------------------------ enchaînement
+    public void AddToChain()
+    {
+        if (SelectedMacro is null) return;
+        Chain.Add(new ChainItem(new ChainEntry { Macro = SelectedMacro.Name, Repeat = 1 }));
+        Play.UseChain = true;
+        Raise(nameof(Play));
+    }
+
+    public void RemoveFromChain(ChainItem item) => Chain.Remove(item);
+
+    public void MoveInChain(ChainItem item, int delta)
+    {
+        int i = Chain.IndexOf(item), j = i + delta;
+        if (i < 0 || j < 0 || j >= Chain.Count) return;
+        Chain.Move(i, j);
+    }
+
+    // ------------------------------------------------------------------ anti-AFK
+    public string AfkNext => Afk.Enabled ? $"Prochain geste vers {_antiAfk.NextAt:HH:mm}" : "Éteint";
+    public void TestAfk() => _antiAfk.Now();
 
     public void RefreshMacros(string? select = null)
     {
@@ -359,7 +506,18 @@ public sealed class MainViewModel : Observable, IDisposable
     {
         if (IsPlaying) { _player.Stop(); return; }
         if (IsRecording) return;
-        if (SelectedMacro?.Macro is not { } macro)
+        var parts = new List<ChainPart>();
+        if (Play.UseChain)
+        {
+            foreach (var c in Chain)
+            {
+                try { parts.Add(new ChainPart(c.Name, _library.Load(c.Name), c.Repeat)); }
+                catch (Exception) { Notify?.Invoke($"La macro « {c.Name} » de l'enchaînement n'existe plus."); return; }
+            }
+            if (parts.Count == 0) { Notify?.Invoke("L'enchaînement est vide : ajoute des macros avec « Ajouter »."); return; }
+        }
+        else if (SelectedMacro?.Macro is { } one) parts.Add(new ChainPart(SelectedMacro.Name, one, 1));
+        else
         {
             Notify?.Invoke("Aucune macro : enregistre-en une d'abord.");
             return;
@@ -373,7 +531,7 @@ public sealed class MainViewModel : Observable, IDisposable
             settings.CountdownSeconds = 3;
             Notify?.Invoke("Lecture dans 3 secondes · retourne dans ton jeu");
         }
-        _player.Start(macro, settings);
+        _player.Start(parts, settings);
         Beep(true);
         Raise(nameof(IsPlaying));
     }
@@ -383,6 +541,8 @@ public sealed class MainViewModel : Observable, IDisposable
         try
         {
             _library.Rename(item.Name, name);
+            foreach (var c in Chain.Where(c => c.Name == item.Name).ToList())
+                Chain[Chain.IndexOf(c)] = new ChainItem(new ChainEntry { Macro = MacroLibrary.SafeName(name), Repeat = c.Repeat });
             RefreshMacros(MacroLibrary.SafeName(name));
         }
         catch (Exception ex) { Notify?.Invoke(ex.Message); }
@@ -428,6 +588,7 @@ public sealed class MainViewModel : Observable, IDisposable
     public void Dispose()
     {
         _tick.Stop();
+        _antiAfk.Dispose();
         StopAll(null);
         SaveIfChanged();
         _hub.Dispose();

@@ -178,6 +178,41 @@ public partial class MainWindow : Window
             _vm.DeleteMacro(m);
     }
 
+    private void PickConditionColor_Click(object sender, RoutedEventArgs e) => _vm.PickConditionColor();
+
+    // ---------- Éditeur, enchaînement, anti-AFK ----------
+
+    private void Undo_Click(object sender, RoutedEventArgs e) => _vm.Undo();
+    private void TrimBefore_Click(object sender, RoutedEventArgs e) => _vm.TrimBefore();
+    private void TrimAfter_Click(object sender, RoutedEventArgs e) => _vm.TrimAfter();
+    private void DeleteStep_Click(object sender, RoutedEventArgs e) => _vm.DeleteStep();
+    private void WaitColor_Click(object sender, RoutedEventArgs e) => _vm.InsertWaitColor(untilGone: false);
+    private void WaitColorGone_Click(object sender, RoutedEventArgs e) => _vm.InsertWaitColor(untilGone: true);
+    private void AddToChain_Click(object sender, RoutedEventArgs e) => _vm.AddToChain();
+    private void TestAfk_Click(object sender, RoutedEventArgs e) => _vm.TestAfk();
+
+    private void RemoveFromChain_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.Tag is ChainItem c) _vm.RemoveFromChain(c);
+    }
+
+    private void ChainUp_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.Tag is ChainItem c) _vm.MoveInChain(c, -1);
+    }
+
+    private void ChainDown_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.Tag is ChainItem c) _vm.MoveInChain(c, +1);
+    }
+
+    /// <summary>Entrée valide un champ numérique (sinon la valeur ne part qu'en quittant le champ).</summary>
+    private void Number_KeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter && sender is System.Windows.Controls.TextBox t)
+            t.GetBindingExpression(System.Windows.Controls.TextBox.TextProperty)?.UpdateSource();
+    }
+
     // ---------- Réglages ----------
 
     private void CaptureBinding_Click(object sender, RoutedEventArgs e)

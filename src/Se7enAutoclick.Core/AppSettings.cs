@@ -29,6 +29,7 @@ public sealed class AppSettings
 {
     public ClickerSettings Clicker { get; set; } = new();
     public PlaybackSettings Playback { get; set; } = new();
+    public AntiAfkSettings AntiAfk { get; set; } = new();
 
     public Dictionary<string, Binding?> Bindings { get; set; } = DefaultBindings();
 

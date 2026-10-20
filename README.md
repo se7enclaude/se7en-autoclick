@@ -20,6 +20,12 @@ Vitesse ×0,25 à ×4, nombre de boucles ou durée, pause entre boucles, aléato
 code matériel (ce que lit Roblox) et la souris en mouvements bruts (la caméra tourne pareil). Plusieurs macros nommées,
 dans `%AppData%\Se7enAutoclick\Macros`.
 
+## Pour farmer
+- **Enchaînement** : plusieurs macros à la suite, chacune répétée (aller au spot ×1, farmer ×20, vendre ×1), en boucle.
+- **Anti-AFK Roblox** : un petit geste toutes les X minutes, même quand Roblox est derrière une autre fenêtre.
+- **Couleurs** : l'autoclic ne clique que quand un point de l'écran a (ou n'a plus) une couleur ; une macro peut attendre une couleur.
+- **Éditeur** : commencer ou finir à une étape, supprimer une étape, changer un délai, annuler.
+
 ## Raccourcis et sécurité
 Tous les raccourcis se changent dans Réglages : touche, combinaison (Ctrl, Maj, Alt) ou bouton de souris. Par défaut :
 F6 autoclic, F9 enregistrer, F10 lire, F8 tout arrêter. **Échap maintenu 1 seconde** arrête tout, et la lecture s'arrête

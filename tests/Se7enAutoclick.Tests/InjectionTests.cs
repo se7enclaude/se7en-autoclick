@@ -9,6 +9,7 @@ namespace Se7enAutoclick.Tests;
 /// L'autoclic et le lecteur, mesurés sans rien envoyer au PC : les entrées simulées sont interceptées
 /// (<see cref="Injector.Redirect"/>) et horodatées.
 /// </summary>
+[Collection("injection")]
 public class InjectionTests : IDisposable
 {
     private readonly object _gate = new();
