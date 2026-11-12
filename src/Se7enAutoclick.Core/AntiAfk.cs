@@ -27,6 +27,14 @@ public sealed class AntiAfk : IDisposable
     private readonly CancellationTokenSource _cts = new();
     private volatile AntiAfkSettings _settings = new();
     private DateTime _last = DateTime.Now;
+    /// <summary>Après un échec (Roblox pas passé devant), réessai à cette heure plutôt qu'au tour suivant.</summary>
+    private long _retryAt; // ticks, 0 = aucun réessai prévu
+    private bool _lastFailed;
+    /// <summary>Un seul geste à la fois (bouton « Tester » et minuterie).</summary>
+    private readonly object _nudgeGate = new();
+
+    /// <summary>Délai avant de réessayer quand Windows refuse de passer Roblox devant.</summary>
+    public static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(30);
 
     /// <summary>Vrai quand l'autoclic ou une macro tourne déjà (le jeu n'est pas inactif : rien à faire).</summary>
     public Func<bool>? IsBusy { get; set; }
@@ -34,7 +42,7 @@ public sealed class AntiAfk : IDisposable
     /// <summary>Compte rendu d'un geste envoyé (ou de l'absence de Roblox).</summary>
     public event Action<string>? Done;
 
-    public DateTime NextAt => _last.AddMinutes(_settings.Minutes);
+    public DateTime NextAt => Interlocked.Read(ref _retryAt) is var r and not 0 ? new DateTime(r) : _last.AddMinutes(_settings.Minutes);
 
     public AntiAfk()
     {
@@ -46,11 +54,11 @@ public sealed class AntiAfk : IDisposable
     {
         bool wasOff = !_settings.Enabled;
         _settings = new AntiAfkSettings { Enabled = s.Enabled, Minutes = Math.Clamp(s.Minutes, 0.5, 19), Action = s.Action };
-        if (wasOff && s.Enabled) _last = DateTime.Now;
+        if (wasOff && s.Enabled) { _last = DateTime.Now; Interlocked.Exchange(ref _retryAt, 0); }
     }
 
     /// <summary>Fait le geste tout de suite (bouton « Tester »).</summary>
-    public void Now() => ThreadPool.QueueUserWorkItem(_ => Nudge());
+    public void Now() => ThreadPool.QueueUserWorkItem(_ => TryNudge());
 
     private void Run()
     {
@@ -58,19 +66,46 @@ public sealed class AntiAfk : IDisposable
         {
             var s = _settings;
             if (!s.Enabled) continue;
-            if (IsBusy?.Invoke() == true) { _last = DateTime.Now; continue; }
+            if (IsBusy?.Invoke() == true) { _last = DateTime.Now; Interlocked.Exchange(ref _retryAt, 0); continue; }
             if (DateTime.Now < NextAt) continue;
             if (IdleMs() < 1500) continue; // tu tapes ou bouges la souris : on réessaie dans 5 s
-            Nudge();
+            TryNudge();
         }
+    }
+
+    private void TryNudge()
+    {
+        if (!Monitor.TryEnter(_nudgeGate)) return; // un geste est déjà en cours
+        try { Nudge(); }
+        catch (Exception ex)
+        {
+            Failed();
+            Done?.Invoke("Anti-AFK : erreur (" + ex.Message + "), réessai dans 30 s.");
+        }
+        finally { Monitor.Exit(_nudgeGate); }
+    }
+
+    /// <summary>Geste réussi : prochain dans N minutes.</summary>
+    private void Succeeded()
+    {
+        _last = DateTime.Now;
+        Interlocked.Exchange(ref _retryAt, 0);
+        _lastFailed = false;
+    }
+
+    /// <summary>Geste raté : on réessaie bientôt (Roblox éjecte à 20 minutes, attendre un tour complet serait trop tard).</summary>
+    private void Failed()
+    {
+        Interlocked.Exchange(ref _retryAt, (DateTime.Now + RetryDelay).Ticks);
+        _lastFailed = true;
     }
 
     private void Nudge()
     {
-        _last = DateTime.Now;
         var windows = RobloxWindows();
         if (windows.Count == 0)
         {
+            Succeeded(); // rien à garder éveillé : prochain essai au tour suivant
             Done?.Invoke("Anti-AFK : Roblox n'est pas ouvert.");
             return;
         }
@@ -88,9 +123,19 @@ public sealed class AntiAfk : IDisposable
             if (wasMinimized) ShowWindow(w, 6); // SW_MINIMIZE
         }
         if (previous != IntPtr.Zero && GetForegroundWindow() != previous) Bring(previous);
-        Done?.Invoke(sent > 0
-            ? $"Anti-AFK : {Label(action)} envoyé à Roblox ({DateTime.Now:HH:mm})"
-            : "Anti-AFK : Windows a refusé de passer Roblox devant, réessai au prochain tour.");
+        if (sent == windows.Count)
+        {
+            Succeeded();
+            Done?.Invoke($"Anti-AFK : {Label(action)} envoyé à Roblox ({DateTime.Now:HH:mm})");
+            return;
+        }
+        bool firstFailure = !_lastFailed;
+        Failed();
+        // on ne le dit qu'une fois, pas à chaque réessai
+        if (firstFailure)
+            Done?.Invoke(sent > 0
+                ? $"Anti-AFK : {Label(action)} envoyé à {sent} fenêtre(s) Roblox sur {windows.Count}, réessai dans 30 s."
+                : "Anti-AFK : Windows a refusé de passer Roblox devant, réessai dans 30 s.");
     }
 
     public static string Label(AfkAction a) => a switch

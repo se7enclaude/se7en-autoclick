@@ -43,12 +43,19 @@ public sealed record ChainPart(string Name, Macro Macro, int Repeat);
 /// </summary>
 public sealed class Player
 {
+    /// <summary>À la lecture, les déplacements de souris plus rapprochés que ça sont regroupés (ms).</summary>
+    public const double MoveGroupMs = 4.0;
+
     private CancellationTokenSource? _cts;
     private Thread? _thread;
-    private readonly HashSet<int> _keysDown = [];
+    private readonly Dictionary<int, (int Scan, bool Ext)> _keysDown = [];
     private readonly HashSet<MouseButton> _buttonsDown = [];
+    private readonly object _releaseGate = new();
+    private volatile bool _running;
+    private int _run;
 
-    public bool IsRunning => _thread is { IsAlive: true };
+    /// <summary>Faux dès que la lecture est finie (avant <see cref="Stopped"/>), même si le fil n'a pas encore disparu.</summary>
+    public bool IsRunning => _running;
     /// <summary>Boucle en cours (1 = première).</summary>
     public int Loop { get; private set; }
     /// <summary>Macro en cours (utile dans un enchaînement).</summary>
@@ -69,10 +76,12 @@ public sealed class Player
         Stop();
         _cts = new CancellationTokenSource();
         var token = _cts.Token;
-        var list = parts.Where(p => p.Repeat > 0 && p.Macro.Events.Count > 0)
-            .Select(p => (p.Name, Events: p.Macro.Events.ToArray(), p.Repeat)).ToList();
         var s = System.Text.Json.JsonSerializer.Deserialize<PlaybackSettings>(System.Text.Json.JsonSerializer.Serialize(settings))!;
-        _thread = new Thread(() => Run(list, s, token)) { IsBackground = true, Name = "macro-player", Priority = ThreadPriority.Highest };
+        var list = parts.Where(p => p.Repeat > 0 && p.Macro.Events.Count > 0)
+            .Select(p => (p.Name, Events: Prepare(p.Macro.Events, s.Mouse), p.Repeat)).ToList();
+        int run = Interlocked.Increment(ref _run);
+        _running = true;
+        _thread = new Thread(() => Run(list, s, token, run)) { IsBackground = true, Name = "macro-player", Priority = ThreadPriority.Highest };
         _thread.Start();
     }
 
@@ -83,7 +92,42 @@ public sealed class Player
         _thread = null;
     }
 
-    private void Run(List<(string Name, MacroEvent[] Events, int Repeat)> parts, PlaybackSettings s, CancellationToken cancel)
+    /// <summary>
+    /// Prépare une macro pour la lecture : on retire les déplacements du mode de souris qui ne sert pas (une souris à
+    /// 1 000 Hz en enregistre des milliers par minute) et on regroupe ceux qui se suivent à moins de
+    /// <see cref="MoveGroupMs"/> (distance totale conservée). Le dernier geste est toujours gardé : il marque la fin
+    /// de la boucle.
+    /// </summary>
+    public static MacroEvent[] Prepare(IReadOnlyList<MacroEvent> events, MouseReplay mouse)
+    {
+        var unused = mouse == MouseReplay.Relative ? EventKind.MoveTo : EventKind.MoveBy;
+        var used = mouse == MouseReplay.Relative ? EventKind.MoveBy : EventKind.MoveTo;
+        var list = new List<MacroEvent>(events.Count);
+        int group = -1; // index du déplacement en cours de regroupement
+        for (int i = 0; i < events.Count; i++)
+        {
+            var e = events[i];
+            bool last = i == events.Count - 1;
+            if (e.Kind == unused && !last) continue;
+            if (e.Kind == used && !last)
+            {
+                if (group >= 0 && e.T - list[group].T < MoveGroupMs)
+                {
+                    var g = list[group];
+                    list[group] = used == EventKind.MoveBy ? g with { A = g.A + e.A, B = g.B + e.B } : g with { A = e.A, B = e.B };
+                    continue;
+                }
+                list.Add(e);
+                group = list.Count - 1;
+                continue;
+            }
+            list.Add(e);
+            group = -1;
+        }
+        return [.. list];
+    }
+
+    private void Run(List<(string Name, MacroEvent[] Events, int Repeat)> parts, PlaybackSettings s, CancellationToken cancel, int run)
     {
         string? reason = null;
         using var clock = new PreciseClock();
@@ -115,11 +159,16 @@ public sealed class Player
                 if (s.PauseMs > 0 && !clock.WaitUntil(clock.NowMs + s.PauseMs, cancel)) return;
             }
         }
+        catch (Exception ex)
+        {
+            reason = "Lecture arrêtée : erreur inattendue (" + ex.Message + ").";
+        }
         finally
         {
             ReleaseAll();
             Progress = 0;
             Waiting = false;
+            if (Volatile.Read(ref _run) == run) _running = false;
             Stopped?.Invoke(reason);
         }
     }
@@ -172,20 +221,20 @@ public sealed class Player
         {
             case EventKind.KeyDown:
                 Injector.Key(e.A, true, e.B, e.Ext);
-                _keysDown.Add(e.A);
+                lock (_releaseGate) _keysDown[e.A] = (e.B, e.Ext);
                 break;
             case EventKind.KeyUp:
                 Injector.Key(e.A, false, e.B, e.Ext);
-                _keysDown.Remove(e.A);
+                lock (_releaseGate) _keysDown.Remove(e.A);
                 break;
             case EventKind.ButtonDown:
                 if (mouse == MouseReplay.Screen) Injector.MoveTo(e.B, e.C);
                 Injector.Button((MouseButton)e.A, true);
-                _buttonsDown.Add((MouseButton)e.A);
+                lock (_releaseGate) _buttonsDown.Add((MouseButton)e.A);
                 break;
             case EventKind.ButtonUp:
                 Injector.Button((MouseButton)e.A, false);
-                _buttonsDown.Remove((MouseButton)e.A);
+                lock (_releaseGate) _buttonsDown.Remove((MouseButton)e.A);
                 break;
             case EventKind.Wheel:
             case EventKind.HWheel:
@@ -200,12 +249,16 @@ public sealed class Player
         }
     }
 
-    /// <summary>Relâche tout ce que la macro a enfoncé.</summary>
-    private void ReleaseAll()
+    /// <summary>Relâche tout ce que la macro a enfoncé (avec le même code matériel qu'à l'appui). Peut être appelé
+    /// d'un autre fil en cas de plantage.</summary>
+    public void ReleaseAll()
     {
-        foreach (var vk in _keysDown) Injector.Key(vk, false);
-        foreach (var b in _buttonsDown) Injector.Button(b, false);
-        _keysDown.Clear();
-        _buttonsDown.Clear();
+        lock (_releaseGate)
+        {
+            foreach (var (vk, k) in _keysDown) Injector.Key(vk, false, k.Scan, k.Ext);
+            foreach (var b in _buttonsDown) Injector.Button(b, false);
+            _keysDown.Clear();
+            _buttonsDown.Clear();
+        }
     }
 }

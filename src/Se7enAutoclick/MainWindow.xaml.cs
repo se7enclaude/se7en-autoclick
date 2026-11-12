@@ -15,10 +15,13 @@ public partial class MainWindow : Window
     private readonly OverlayWindow _overlay;
     private bool _exiting, _trayHintShown;
 
+    /// <summary>Le modèle de la fenêtre (le gestionnaire de plantage s'en sert pour tout arrêter).</summary>
+    public MainViewModel ViewModel => _vm;
+
     public MainWindow(bool startMinimized)
     {
         InitializeComponent();
-        _vm = new MainViewModel();
+        _vm = new MainViewModel { WindowVisible = !startMinimized };
         DataContext = _vm;
         _vm.Notify += ShowToast;
 
@@ -46,6 +49,13 @@ public partial class MainWindow : Window
             Visible = true,
         };
         _tray.MouseClick += (_, e) => { if (e.Button == Forms.MouseButtons.Left) ShowFromTray(); };
+
+        // toute saisie dans la fenêtre peut changer un réglage : enregistrement différé (voir MarkDirty)
+        PreviewMouseUp += (_, _) => _vm.MarkDirty();
+        PreviewKeyUp += (_, _) => _vm.MarkDirty();
+        PreviewMouseWheel += (_, _) => _vm.MarkDirty();
+        LostKeyboardFocus += (_, _) => _vm.MarkDirty();
+        IsVisibleChanged += (_, _) => UpdateVisibility();
 
         Closing += OnClosing;
         if (startMinimized)
@@ -115,9 +125,12 @@ public partial class MainWindow : Window
         WindowState = WindowState == WindowState.Maximized ? WindowState.Normal : WindowState.Maximized;
     private void Close_Click(object sender, RoutedEventArgs e) => Close();
 
+    private void UpdateVisibility() => _vm.WindowVisible = IsVisible && WindowState != WindowState.Minimized;
+
     protected override void OnStateChanged(EventArgs e)
     {
         base.OnStateChanged(e);
+        UpdateVisibility();
         // Sans bordure Windows, une fenêtre maximisée déborde un peu de l'écran.
         BorderThickness = WindowState == WindowState.Maximized ? new Thickness(7) : new Thickness(0);
     }

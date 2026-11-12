@@ -50,11 +50,23 @@ public sealed class MainViewModel : Observable, IDisposable
     private readonly AntiAfk _antiAfk = new();
     private readonly Stack<Macro> _undo = new();
     private readonly MacroLibrary _library = new(AppSettings.MacrosFolder);
-    private readonly DispatcherTimer _tick;
+    private readonly DispatcherTimer _tick, _saveDelay;
     private readonly Dispatcher _ui = Application.Current.Dispatcher;
     private Recorder? _recorder;
     private double _recordStart;
     private string _lastSaved = "";
+    private bool _dirty, _saveFailed;
+
+    /// <summary>Rythme de l'affichage : vif quand on regarde ou que quelque chose tourne, lent sinon.</summary>
+    private static readonly TimeSpan FastTick = TimeSpan.FromMilliseconds(100), SlowTick = TimeSpan.FromSeconds(1);
+
+    /// <summary>Propriétés rafraîchies par la minuterie : elles ne veulent pas dire « réglage modifié ».</summary>
+    private static readonly HashSet<string> TickProperties =
+    [
+        nameof(ClickCount), nameof(MeasuredCps), nameof(RecordTime), nameof(RecordEvents), nameof(PlayProgress),
+        nameof(PlayLoop), nameof(PlayCurrent), nameof(AfkNext), nameof(Status), nameof(Busy), nameof(ClickerRunning),
+        nameof(IsPlaying), nameof(IsRecording),
+    ];
 
     public AppSettings Settings { get; } = AppSettings.Load();
     public ClickerSettings Click => Settings.Clicker;
@@ -78,9 +90,11 @@ public sealed class MainViewModel : Observable, IDisposable
         RefreshMacros(Settings.CurrentMacro);
         foreach (var c in Play.Chain) Chain.Add(new ChainItem(c));
         _lastSaved = System.Text.Json.JsonSerializer.Serialize(Settings);
+        if (AppSettings.LoadProblem is { } problem) _ui.BeginInvoke(() => Notify?.Invoke(problem));
 
         _hub.Hotkey += (id, down) => _ui.BeginInvoke(() => OnHotkey(id, down));
         _hub.EmergencyStop += () => _ui.BeginInvoke(() => StopAll("Arrêt d'urgence (Échap maintenu)"));
+        _hub.Problem += msg => _ui.BeginInvoke(() => Notify?.Invoke(msg));
         _clicker.Stopped += () => _ui.BeginInvoke(() => { Raise(nameof(ClickerRunning)); Raise(nameof(Status)); });
         _player.Stopped += reason => _ui.BeginInvoke(() =>
         {
@@ -94,8 +108,46 @@ public sealed class MainViewModel : Observable, IDisposable
         _antiAfk.Done += msg => _ui.BeginInvoke(() => { Notify?.Invoke(msg); Raise(nameof(AfkNext)); });
         _antiAfk.Apply(Afk);
 
-        _tick = new DispatcherTimer(TimeSpan.FromMilliseconds(100), DispatcherPriority.Background, (_, _) => Tick(), _ui);
+        // réglages : enregistrés ~500 ms après la dernière modification (plus de sérialisation à chaque tick)
+        _saveDelay = new DispatcherTimer(TimeSpan.FromMilliseconds(500), DispatcherPriority.Background, (_, _) => SaveIfChanged(), _ui);
+        _saveDelay.Stop();
+        PropertyChanged += (_, e) => { if (e.PropertyName is not { } n || !TickProperties.Contains(n)) MarkDirty(); };
+        Points.CollectionChanged += (_, _) => MarkDirty();
+        Chain.CollectionChanged += (_, _) => MarkDirty();
+
+        _tick = new DispatcherTimer(FastTick, DispatcherPriority.Background, (_, _) => Tick(), _ui);
         _tick.Start();
+
+        // veille et verrouillage : Windows peut retirer nos hooks en silence, et les relâchements se perdent
+        Microsoft.Win32.SystemEvents.SessionSwitch += OnSessionSwitch;
+        Microsoft.Win32.SystemEvents.PowerModeChanged += OnPowerModeChanged;
+    }
+
+    private void OnSessionSwitch(object? sender, Microsoft.Win32.SessionSwitchEventArgs e)
+    {
+        if (e.Reason is Microsoft.Win32.SessionSwitchReason.SessionLock or Microsoft.Win32.SessionSwitchReason.ConsoleDisconnect
+            or Microsoft.Win32.SessionSwitchReason.RemoteDisconnect)
+            _hub.SessionLocked();
+        else if (e.Reason is Microsoft.Win32.SessionSwitchReason.SessionUnlock or Microsoft.Win32.SessionSwitchReason.ConsoleConnect
+                 or Microsoft.Win32.SessionSwitchReason.RemoteConnect)
+            _hub.Reinstall();
+    }
+
+    private void OnPowerModeChanged(object? sender, Microsoft.Win32.PowerModeChangedEventArgs e)
+    {
+        if (e.Mode == Microsoft.Win32.PowerModes.Suspend) _hub.SessionLocked();
+        else if (e.Mode == Microsoft.Win32.PowerModes.Resume) _hub.Reinstall();
+    }
+
+    /// <summary>La fenêtre est visible (ni cachée dans la zone de notification, ni réduite).</summary>
+    public bool WindowVisible { get; set; } = true;
+
+    /// <summary>Un réglage a peut-être changé (saisie dans la fenêtre, liste modifiée…) : on enregistrera bientôt.</summary>
+    public void MarkDirty()
+    {
+        _dirty = true;
+        _saveDelay.Stop();
+        _saveDelay.Start();
     }
 
     // ------------------------------------------------------------------ état
@@ -130,18 +182,32 @@ public sealed class MainViewModel : Observable, IDisposable
         if (Afk.Enabled) Raise(nameof(AfkNext));
         Raise(nameof(Status));
         Raise(nameof(Busy));
-        SaveIfChanged();
+        var interval = Busy || WindowVisible ? FastTick : SlowTick;
+        if (_tick.Interval != interval) _tick.Interval = interval;
     }
 
     private void SaveIfChanged()
     {
+        _saveDelay.Stop();
+        if (!_dirty) return;
+        _dirty = false;
         Click.Points = Points.ToList();
         Play.Chain = Chain.Select(c => c.Entry).ToList();
         _antiAfk.Apply(Afk);
         string json = System.Text.Json.JsonSerializer.Serialize(Settings);
         if (json == _lastSaved) return;
-        _lastSaved = json;
-        Settings.Save();
+        try
+        {
+            Settings.Save();
+            _lastSaved = json;
+            _saveFailed = false;
+        }
+        catch (Exception ex)
+        {
+            _dirty = true; // on réessaiera à la prochaine modification
+            if (!_saveFailed) Notify?.Invoke("Réglages non enregistrés : " + ex.Message);
+            _saveFailed = true;
+        }
     }
 
     // ------------------------------------------------------------------ raccourcis
@@ -410,7 +476,13 @@ public sealed class MainViewModel : Observable, IDisposable
     {
         if (_undo.Count == 0 || SelectedMacro is null) return;
         var previous = _undo.Pop();
-        _library.Save(previous);
+        try { _library.Save(previous); }
+        catch (Exception ex)
+        {
+            _undo.Push(previous);
+            Notify?.Invoke("Annulation impossible : " + ex.Message);
+            return;
+        }
         RefreshMacros(previous.Name);
         Raise(nameof(CanUndo));
     }
@@ -497,7 +569,12 @@ public sealed class MainViewModel : Observable, IDisposable
             Notify?.Invoke("Rien n'a été enregistré.");
             return;
         }
-        _library.Save(macro);
+        try { _library.Save(macro); }
+        catch (Exception ex)
+        {
+            Notify?.Invoke("Impossible d'enregistrer la macro : " + ex.Message);
+            return;
+        }
         RefreshMacros(macro.Name);
         Notify?.Invoke($"« {macro.Name} » enregistrée · {PlayKey} pour la rejouer en boucle");
     }
@@ -548,11 +625,16 @@ public sealed class MainViewModel : Observable, IDisposable
         catch (Exception ex) { Notify?.Invoke(ex.Message); }
     }
 
-    public void DuplicateMacro(MacroItem item) => RefreshMacros(_library.Duplicate(item.Name));
+    public void DuplicateMacro(MacroItem item)
+    {
+        try { RefreshMacros(_library.Duplicate(item.Name)); }
+        catch (Exception ex) { Notify?.Invoke("Copie impossible : " + ex.Message); }
+    }
 
     public void DeleteMacro(MacroItem item)
     {
-        _library.Delete(item.Name);
+        try { _library.Delete(item.Name); }
+        catch (Exception ex) { Notify?.Invoke("Suppression impossible : " + ex.Message); }
         RefreshMacros();
     }
 
@@ -573,6 +655,16 @@ public sealed class MainViewModel : Observable, IDisposable
         if (any && message is not null) Notify?.Invoke(message);
     }
 
+    /// <summary>Plantage : tout s'arrête et plus rien ne reste enfoncé, depuis n'importe quel fil.</summary>
+    public void EmergencyRelease()
+    {
+        try { _clicker.Stop(); } catch (Exception) { }
+        try { _player.Stop(); } catch (Exception) { }
+        try { _clicker.ReleaseNow(); } catch (Exception) { }
+        try { _player.ReleaseAll(); } catch (Exception) { }
+        try { _hub.StopRecording(); _hub.CancelCapture(); } catch (Exception) { }
+    }
+
     public bool AutostartEnabled
     {
         get => Services.Autostart.IsEnabled;
@@ -587,9 +679,12 @@ public sealed class MainViewModel : Observable, IDisposable
 
     public void Dispose()
     {
+        Microsoft.Win32.SystemEvents.SessionSwitch -= OnSessionSwitch;
+        Microsoft.Win32.SystemEvents.PowerModeChanged -= OnPowerModeChanged;
         _tick.Stop();
         _antiAfk.Dispose();
         StopAll(null);
+        _dirty = true;
         SaveIfChanged();
         _hub.Dispose();
     }

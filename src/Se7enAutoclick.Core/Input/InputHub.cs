@@ -25,18 +25,22 @@ public interface IInputSink
 /// <item>enregistrement des macros : touches, clics, molette, positions, et déplacements bruts de la souris
 /// (la caméra des jeux 3D, quand le curseur est bloqué).</item>
 /// </list>
-/// Nos propres entrées simulées (et celles des autres logiciels) sont ignorées.
+/// Nos propres entrées simulées (et celles des autres logiciels) sont ignorées, y compris pour les modificateurs :
+/// une macro qui tient Maj ne bloque pas les raccourcis. Le hook souris n'est posé que s'il sert (enregistrement,
+/// capture, choix d'un point, raccourci sur un bouton de souris).
 /// </summary>
 public sealed class InputHub : IDisposable
 {
-    private const uint WmStartRaw = WmApp + 1, WmStopRaw = WmApp + 2;
+    private const uint WmStartRaw = WmApp + 1, WmStopRaw = WmApp + 2, WmUpdateHooks = WmApp + 3, WmReinstall = WmApp + 4,
+                       WmSessionLock = WmApp + 5;
 
     private readonly Thread _thread;
     private readonly ManualResetEventSlim _ready = new();
     private readonly Stopwatch _clock = Stopwatch.StartNew();
     private uint _threadId;
-    private IntPtr _kbHook, _msHook, _rawWindow;
+    private IntPtr _kbHook, _msHook, _rawWindow, _module;
     private HookProc? _kbProc, _msProc;
+    private readonly PhysicalMods _mods = new(); // fil des hooks seulement
     private WndProc? _wndProc;
 
     private readonly object _gate = new();
@@ -58,6 +62,9 @@ public sealed class InputHub : IDisposable
     /// <summary>Échap maintenu une seconde.</summary>
     public event Action? EmergencyStop;
 
+    /// <summary>Problème à signaler (hook refusé par Windows…). Appelé hors du fil des hooks.</summary>
+    public event Action<string>? Problem;
+
     public InputHub()
     {
         _thread = new Thread(Run) { IsBackground = true, Name = "input-hub", Priority = ThreadPriority.Highest };
@@ -75,6 +82,20 @@ public sealed class InputHub : IDisposable
     {
         lock (_gate)
             _bindings = bindings.Where(b => b.Value is not null).ToDictionary(b => b.Key, b => b.Value!);
+        RequestHookUpdate();
+    }
+
+    /// <summary>Réinstalle les hooks (sortie de veille, déverrouillage : Windows a pu les retirer en silence).</summary>
+    public void Reinstall() => Post(WmReinstall);
+
+    /// <summary>Session verrouillée : les relâchements ne nous parviendront pas, on oublie tout ce qui est tenu.</summary>
+    public void SessionLocked() => Post(WmSessionLock);
+
+    private void RequestHookUpdate() => Post(WmUpdateHooks);
+
+    private void Post(uint msg)
+    {
+        if (_threadId != 0) PostThreadMessage(_threadId, msg, IntPtr.Zero, IntPtr.Zero);
     }
 
     /// <summary>Attend la prochaine touche ou le prochain bouton (hors clic gauche) ; Échap annule (null).</summary>
@@ -86,6 +107,7 @@ public sealed class InputHub : IDisposable
             _capture?.TrySetResult(null);
             _capture = tcs;
         }
+        RequestHookUpdate();
         return tcs.Task;
     }
 
@@ -98,6 +120,7 @@ public sealed class InputHub : IDisposable
             _point?.TrySetResult(null);
             _point = null;
         }
+        RequestHookUpdate();
     }
 
     /// <summary>Attend le prochain clic gauche n'importe où à l'écran et donne sa position (le clic n'est pas transmis).
@@ -110,6 +133,7 @@ public sealed class InputHub : IDisposable
             _point?.TrySetResult(null);
             _point = tcs;
         }
+        RequestHookUpdate();
         return tcs.Task;
     }
 
@@ -117,31 +141,35 @@ public sealed class InputHub : IDisposable
     public void StartRecording(IInputSink sink)
     {
         _sink = sink;
-        PostThreadMessage(_threadId, WmStartRaw, IntPtr.Zero, IntPtr.Zero);
+        Post(WmStartRaw);
+        RequestHookUpdate();
     }
 
     public void StopRecording()
     {
         _sink = null;
-        PostThreadMessage(_threadId, WmStopRaw, IntPtr.Zero, IntPtr.Zero);
+        Post(WmStopRaw);
+        RequestHookUpdate();
     }
 
     // ------------------------------------------------------------------ fil des hooks
     private void Run()
     {
         _threadId = GetCurrentThreadId();
-        var module = GetModuleHandle(null);
+        _module = GetModuleHandle(null);
         _kbProc = KeyboardProc;
         _msProc = MouseProc;
-        _kbHook = SetWindowsHookEx(WhKeyboardLl, _kbProc, module, 0);
-        _msHook = SetWindowsHookEx(WhMouseLl, _msProc, module, 0);
-        _rawWindow = CreateRawWindow(module);
+        InstallKeyboard();
+        _rawWindow = CreateRawWindow(_module);
         _ready.Set();
 
         while (GetMessage(out var msg, IntPtr.Zero, 0, 0) > 0)
         {
             if (msg.Hwnd == IntPtr.Zero && msg.Message == WmStartRaw) SetRaw(true);
             else if (msg.Hwnd == IntPtr.Zero && msg.Message == WmStopRaw) SetRaw(false);
+            else if (msg.Hwnd == IntPtr.Zero && msg.Message == WmUpdateHooks) UpdateMouseHook();
+            else if (msg.Hwnd == IntPtr.Zero && msg.Message == WmReinstall) ReinstallHooks();
+            else if (msg.Hwnd == IntPtr.Zero && msg.Message == WmSessionLock) ForgetHeld();
             else
             {
                 TranslateMessage(ref msg);
@@ -152,6 +180,66 @@ public sealed class InputHub : IDisposable
         if (_kbHook != IntPtr.Zero) UnhookWindowsHookEx(_kbHook);
         if (_msHook != IntPtr.Zero) UnhookWindowsHookEx(_msHook);
         if (_rawWindow != IntPtr.Zero) DestroyWindow(_rawWindow);
+    }
+
+    private void Report(string message) => _events.Add(() => Problem?.Invoke(message));
+
+    private void InstallKeyboard()
+    {
+        _kbHook = SetWindowsHookEx(WhKeyboardLl, _kbProc!, _module, 0);
+        if (_kbHook == IntPtr.Zero)
+            Report($"Windows a refusé l'écoute du clavier (erreur {Marshal.GetLastWin32Error()}) : les raccourcis ne marchent pas. Relance l'appli.");
+    }
+
+    /// <summary>Pose ou retire le hook souris selon le besoin (fil des hooks).</summary>
+    private void UpdateMouseHook()
+    {
+        bool need;
+        lock (_gate)
+            need = _sink is not null || _capture is not null || _point is not null || _swallowPointUp
+                   || _swallowedButtons.Count > 0 || _bindings.Values.Any(b => b.IsMouse);
+        if (need && _msHook == IntPtr.Zero)
+        {
+            _msHook = SetWindowsHookEx(WhMouseLl, _msProc!, _module, 0);
+            if (_msHook == IntPtr.Zero)
+                Report($"Windows a refusé l'écoute de la souris (erreur {Marshal.GetLastWin32Error()}) : clics et raccourcis souris non vus.");
+        }
+        else if (!need && _msHook != IntPtr.Zero)
+        {
+            UnhookWindowsHookEx(_msHook);
+            _msHook = IntPtr.Zero;
+        }
+    }
+
+    private void ReinstallHooks()
+    {
+        if (_kbHook != IntPtr.Zero) UnhookWindowsHookEx(_kbHook);
+        if (_msHook != IntPtr.Zero) UnhookWindowsHookEx(_msHook);
+        _kbHook = _msHook = IntPtr.Zero;
+        _mods.Clear();
+        InstallKeyboard();
+        UpdateMouseHook();
+    }
+
+    /// <summary>Oublie les touches et raccourcis tenus ; les raccourcis tenus sont signalés relâchés.</summary>
+    private void ForgetHeld()
+    {
+        lock (_gate)
+        {
+            foreach (var id in _held)
+            {
+                string fired = id;
+                _events.Add(() => Hotkey?.Invoke(fired, false));
+            }
+            _held.Clear();
+            _swallowedKeys.Clear();
+            _swallowedButtons.Clear();
+            _swallowPointUp = false;
+        }
+        _mods.Clear();
+        _escDownAt = -1;
+        _escFired = false;
+        UpdateMouseHook();
     }
 
     private IntPtr CreateRawWindow(IntPtr module)
@@ -197,15 +285,8 @@ public sealed class InputHub : IDisposable
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
 
-    private static Mods CurrentMods()
-    {
-        var m = Mods.None;
-        if (Injector.IsDown(0x11)) m |= Mods.Ctrl;
-        if (Injector.IsDown(0x10)) m |= Mods.Shift;
-        if (Injector.IsDown(0x12)) m |= Mods.Alt;
-        if (Injector.IsDown(0x5B) || Injector.IsDown(0x5C)) m |= Mods.Win;
-        return m;
-    }
+    /// <summary>Modificateurs tenus physiquement (pas ceux d'une macro ni d'un autre logiciel).</summary>
+    private Mods CurrentMods() => _mods.Current(Injector.IsDown);
 
     private IntPtr KeyboardProc(int code, IntPtr wParam, IntPtr lParam)
     {
@@ -215,6 +296,7 @@ public sealed class InputHub : IDisposable
             int msg = wParam.ToInt32();
             bool down = msg is WmKeyDown or WmSysKeyDown;
             bool injected = (k.Flags & LlkhfInjected) != 0;
+            if (!injected) _mods.Update((int)k.Vk, down);
             if (!injected && HandleKey((int)k.Vk, (int)k.Scan, (k.Flags & LlkhfExtended) != 0, down))
                 return 1; // avalé : le jeu ne le voit pas
         }
@@ -242,6 +324,7 @@ public sealed class InputHub : IDisposable
                 _point.TrySetResult(null);
                 _point = null;
                 _swallowedKeys.Add(vk);
+                RequestHookUpdate();
                 return true;
             }
             if (_capture is not null && down && !KeyNames.IsModifier(vk))
@@ -250,6 +333,7 @@ public sealed class InputHub : IDisposable
                 _capture = null;
                 _swallowedKeys.Add(vk);
                 tcs.TrySetResult(vk == 0x1B ? null : Binding.Key(vk, CurrentMods()));
+                RequestHookUpdate();
                 return true;
             }
             if (!down && _swallowedKeys.Remove(vk))
@@ -272,8 +356,12 @@ public sealed class InputHub : IDisposable
         if (code >= 0)
         {
             var m = Marshal.PtrToStructure<MsLlHook>(lParam);
-            if ((m.Flags & LlmhfInjected) == 0 && HandleMouse(wParam.ToInt32(), m))
+            int msg = wParam.ToInt32();
+            if ((m.Flags & LlmhfInjected) == 0 && HandleMouse(msg, m))
+            {
+                RequestHookUpdate(); // capture finie : le hook souris sert-il encore ?
                 return 1;
+            }
         }
         return CallNextHookEx(_msHook, code, wParam, lParam);
     }
@@ -345,12 +433,17 @@ public sealed class InputHub : IDisposable
         return false;
     }
 
-    /// <summary>Raccourci correspondant exactement (même touche, mêmes modificateurs).</summary>
-    private string? Match(bool mouse, int code)
+    private string? Match(bool mouse, int code) => Match(_bindings, mouse, code, CurrentMods());
+
+    /// <summary>Raccourci correspondant : d'abord exactement (même touche, mêmes modificateurs), sinon un raccourci
+    /// sans modificateur sur la même touche, quels que soient les modificateurs tenus (F8 arrête tout même avec Maj
+    /// enfoncé).</summary>
+    internal static string? Match(IReadOnlyDictionary<string, Binding> bindings, bool mouse, int code, Mods mods)
     {
-        var mods = CurrentMods();
-        foreach (var (id, b) in _bindings)
+        foreach (var (id, b) in bindings)
             if (b.IsMouse == mouse && b.Code == code && b.Mods == mods) return id;
+        foreach (var (id, b) in bindings)
+            if (b.IsMouse == mouse && b.Code == code && b.Mods == Mods.None) return id;
         return null;
     }
 
@@ -372,5 +465,37 @@ public sealed class InputHub : IDisposable
         if (_threadId != 0) PostThreadMessage(_threadId, WmQuit, IntPtr.Zero, IntPtr.Zero);
         _thread.Join(1000);
         _events.CompleteAdding();
+    }
+}
+
+/// <summary>Modificateurs tenus physiquement, suivis dans le hook clavier à partir des seuls évènements non simulés.</summary>
+internal sealed class PhysicalMods
+{
+    private readonly HashSet<int> _down = [];
+
+    public void Update(int vk, bool down)
+    {
+        if (!KeyNames.IsModifier(vk)) return;
+        if (down) _down.Add(vk);
+        else _down.Remove(vk);
+    }
+
+    public void Clear() => _down.Clear();
+
+    /// <summary><paramref name="isDown"/> : état réel de la touche ; si Windows la dit relâchée, elle l'est aussi
+    /// physiquement (rattrape un relâchement manqué, verrouillage avec Win+L par exemple).</summary>
+    public Mods Current(Func<int, bool>? isDown = null)
+    {
+        if (isDown is not null) _down.RemoveWhere(vk => !isDown(vk));
+        var m = Mods.None;
+        foreach (var vk in _down)
+            m |= vk switch
+            {
+                0x11 or 0xA2 or 0xA3 => Mods.Ctrl,
+                0x10 or 0xA0 or 0xA1 => Mods.Shift,
+                0x12 or 0xA4 or 0xA5 => Mods.Alt,
+                _ => Mods.Win,
+            };
+        return m;
     }
 }

@@ -42,8 +42,19 @@ public sealed class ClickerSettings
 
     public double Cps => 1000.0 / Math.Max(0.5, IntervalMs);
 
-    /// <summary>Durée d'appui réellement utilisée.</summary>
-    public double EffectiveHoldMs => HoldMs > 0 ? Math.Min(HoldMs, Math.Max(0, IntervalMs - 0.2)) : Math.Min(15, IntervalMs * 0.4);
+    /// <summary>Durée d'appui réellement utilisée. En double-clic, deux appuis et l'écart doivent tenir dans
+    /// l'intervalle : chacun est plafonné au quart de l'intervalle.</summary>
+    public double EffectiveHoldMs
+    {
+        get
+        {
+            double hold = HoldMs > 0 ? Math.Min(HoldMs, Math.Max(0, IntervalMs - 0.2)) : Math.Min(15, IntervalMs * 0.4);
+            return DoubleClick ? Math.Min(hold, IntervalMs / 4) : hold;
+        }
+    }
+
+    /// <summary>Double-clic : écart entre les deux clics (30 ms au plus, jamais plus d'un quart de l'intervalle).</summary>
+    public double DoubleClickGapMs => Math.Min(Math.Max(EffectiveHoldMs, Math.Min(30, IntervalMs / 3)), IntervalMs / 4);
 }
 
 /// <summary>
@@ -53,11 +64,14 @@ public sealed class Clicker
 {
     private CancellationTokenSource? _cts;
     private Thread? _thread;
+    private volatile bool _running;
+    private int _run;
     private long _clicks;
     private readonly Queue<double> _recent = new();
     private readonly object _statsGate = new();
 
-    public bool IsRunning => _thread is { IsAlive: true };
+    /// <summary>Faux dès que l'autoclic est fini (avant <see cref="Stopped"/>), même si le fil n'a pas encore disparu.</summary>
+    public bool IsRunning => _running;
     public long Clicks => Interlocked.Read(ref _clicks);
 
     /// <summary>Clics réellement envoyés sur la dernière seconde.</summary>
@@ -77,15 +91,20 @@ public sealed class Clicker
     /// <summary>Fin du clic automatique (limite atteinte ou arrêt).</summary>
     public event Action? Stopped;
 
+    private ClickerSettings? _settings;
+
     public void Start(ClickerSettings s)
     {
         Stop();
         var settings = Clone(s);
+        _settings = settings;
         _cts = new CancellationTokenSource();
         var token = _cts.Token;
         Interlocked.Exchange(ref _clicks, 0);
         lock (_statsGate) _recent.Clear();
-        _thread = new Thread(() => Run(settings, token)) { IsBackground = true, Name = "clicker", Priority = ThreadPriority.Highest };
+        int run = Interlocked.Increment(ref _run);
+        _running = true;
+        _thread = new Thread(() => Run(settings, token, run)) { IsBackground = true, Name = "clicker", Priority = ThreadPriority.Highest };
         _thread.Start();
     }
 
@@ -96,12 +115,18 @@ public sealed class Clicker
         _thread = null;
     }
 
-    private void Run(ClickerSettings s, CancellationToken cancel)
+    /// <summary>Relâche le bouton ou la touche de l'autoclic (plantage : rien ne doit rester enfoncé).</summary>
+    public void ReleaseNow()
+    {
+        if (_settings is { } s) Press(s, false);
+    }
+
+    private void Run(ClickerSettings s, CancellationToken cancel, int run)
     {
         using var clock = new PreciseClock();
         var rng = new Random();
         double start = clock.NowMs, next = start;
-        double hold = s.EffectiveHoldMs;
+        double hold = s.EffectiveHoldMs, gap = s.DoubleClickGapMs;
         int point = 0;
         try
         {
@@ -132,8 +157,8 @@ public sealed class Clicker
                     Press(s, true);
                     if (hold > 0 && !clock.WaitUntil(clock.NowMs + hold, cancel)) { Press(s, false); return; }
                     Press(s, false);
-                    // double-clic : écart court (30 ms au plus, moins à très haute vitesse)
-                    if (s.DoubleClick && k == 0 && !clock.WaitUntil(clock.NowMs + Math.Max(hold, Math.Min(30, s.IntervalMs / 3)), cancel)) return;
+                    // double-clic : écart court (30 ms au plus, un quart de l'intervalle à haute vitesse)
+                    if (s.DoubleClick && k == 0 && !clock.WaitUntil(clock.NowMs + gap, cancel)) return;
                 }
                 done++;
                 Interlocked.Increment(ref _clicks);
@@ -145,8 +170,13 @@ public sealed class Clicker
                 if (next < clock.NowMs - s.IntervalMs * 4) start = clock.NowMs - (n + 1) * s.IntervalMs; // PC bloqué : on repart sans rafale
             }
         }
+        catch (Exception)
+        {
+            Press(s, false); // erreur inattendue : rien ne reste enfoncé
+        }
         finally
         {
+            if (Volatile.Read(ref _run) == run) _running = false;
             Stopped?.Invoke();
         }
     }

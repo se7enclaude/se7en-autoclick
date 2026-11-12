@@ -10,12 +10,12 @@ namespace Se7enAutoclick.Core.Macros;
 public sealed class Recorder : IInputSink
 {
     /// <summary>Les déplacements plus rapprochés que ça sont additionnés (ms).</summary>
-    public const double MoveMergeMs = 2.0;
+    public const double MoveMergeMs = 4.0;
 
     private readonly object _gate = new();
     private readonly List<MacroEvent> _events = [];
     private readonly double _start;
-    private readonly HashSet<int> _keysDown = [];
+    private readonly Dictionary<int, (int Scan, bool Ext)> _keysDown = [];
     private readonly HashSet<MouseButton> _buttonsDown = [];
 
     public Recorder(double startMs) => _start = startMs;
@@ -29,7 +29,7 @@ public sealed class Recorder : IInputSink
         lock (_gate)
         {
             // la répétition automatique d'une touche tenue n'est pas un nouvel appui
-            if (down && !_keysDown.Add(vk)) return;
+            if (down && !_keysDown.TryAdd(vk, (scan, extended))) return;
             if (!down && !_keysDown.Remove(vk)) return;
             _events.Add(new MacroEvent(Rel(t), down ? EventKind.KeyDown : EventKind.KeyUp, vk, scan, 0, extended));
         }
@@ -65,7 +65,7 @@ public sealed class Recorder : IInputSink
                 var last = _events[i];
                 if (last.Kind is not (EventKind.MoveTo or EventKind.MoveBy)) break;
                 if (last.Kind != kind) continue;
-                if (t - last.T > MoveMergeMs) break;
+                if (t - last.T >= MoveMergeMs) break;
                 var (na, nb) = merge(last, e);
                 _events[i] = last with { A = na, B = nb };
                 return;
@@ -96,7 +96,8 @@ public sealed class Recorder : IInputSink
                     _buttonsDown.Remove(MouseButton.Left);
                 }
             }
-            foreach (var vk in _keysDown) _events.Add(new MacroEvent(end, EventKind.KeyUp, vk));
+            // relâchées avec le même code matériel qu'à l'appui (les jeux lisent le clavier physique)
+            foreach (var (vk, k) in _keysDown) _events.Add(new MacroEvent(end, EventKind.KeyUp, vk, k.Scan, 0, k.Ext));
             foreach (var bt in _buttonsDown) _events.Add(new MacroEvent(end, EventKind.ButtonUp, (int)bt));
             _keysDown.Clear();
             _buttonsDown.Clear();

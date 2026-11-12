@@ -57,31 +57,56 @@ public sealed class AppSettings
 
     private static readonly JsonSerializerOptions Json = new() { WriteIndented = true };
 
-    public static AppSettings Load()
+    /// <summary>Message pour l'utilisateur si le dernier chargement a dû repartir des réglages par défaut.</summary>
+    public static string? LoadProblem { get; private set; }
+
+    public static AppSettings Load() => Load(FilePath);
+
+    /// <summary>Charge les réglages. Un fichier illisible (abîmé) est mis de côté en « .corrompu » avant de repartir
+    /// des réglages par défaut : la prochaine sauvegarde ne l'écrase pas sans laisser de trace.</summary>
+    public static AppSettings Load(string path)
     {
+        LoadProblem = null;
+        string text;
         try
         {
-            if (File.Exists(FilePath))
-            {
-                var s = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(FilePath), Json) ?? new AppSettings();
-                foreach (var (id, b) in DefaultBindings())
-                    s.Bindings.TryAdd(id, b); // raccourcis ajoutés par une mise à jour
-                return s;
-            }
+            if (!File.Exists(path)) return new AppSettings();
+            text = File.ReadAllText(path);
         }
-        catch (Exception) { }
-        return new AppSettings();
+        catch (Exception ex)
+        {
+            LoadProblem = "Réglages illisibles (" + ex.Message + ") : réglages par défaut pour cette fois.";
+            return new AppSettings();
+        }
+        try
+        {
+            var s = JsonSerializer.Deserialize<AppSettings>(text, Json) ?? throw new JsonException("fichier vide");
+            s.Bindings ??= [];
+            foreach (var (id, b) in DefaultBindings())
+                s.Bindings.TryAdd(id, b); // raccourcis ajoutés par une mise à jour
+            s.Clicker ??= new();
+            s.Playback ??= new();
+            s.AntiAfk ??= new();
+            return s;
+        }
+        catch (Exception)
+        {
+            string aside = path + ".corrompu";
+            try { File.Move(path, aside, true); }
+            catch (Exception) { aside = "(impossible de le mettre de côté)"; }
+            LoadProblem = $"Réglages abîmés : réglages par défaut. L'ancien fichier est gardé dans {aside}";
+            return new AppSettings();
+        }
     }
 
-    public void Save()
+    /// <summary>Enregistre les réglages (fichier temporaire puis remplacement). Lève une exception en cas d'échec.</summary>
+    public void Save() => Save(FilePath);
+
+    public void Save(string path)
     {
-        try
-        {
-            Directory.CreateDirectory(Folder);
-            string tmp = FilePath + ".tmp";
-            File.WriteAllText(tmp, JsonSerializer.Serialize(this, Json));
-            File.Move(tmp, FilePath, true);
-        }
-        catch (Exception) { }
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        string tmp = path + ".tmp";
+        File.WriteAllText(tmp, JsonSerializer.Serialize(this, Json));
+        File.Move(tmp, path, true);
     }
 }
